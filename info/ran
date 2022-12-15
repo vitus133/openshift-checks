@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# description: Exports RAN-specific configurations
+
+[ -z "${UTILSFILE}" ] && source $(echo "$(dirname "${0}")/../utils")
+tmperrorfile=$(mktemp)
+errorfile=$(mktemp)
+trap 'rm ${errorfile}; rm ${tmperrorfile}' EXIT
+echo 0 >"$tmperrorfile"
+
+
+check_wlp_configured(){
+  if oc auth can-i get node >/dev/null 2>&1; then
+    # shellcheck disable=SC2016
+    for node in $(oc get nodes -o go-template='{{range .items}}{{$node := .}}{{range .status.conditions}}{{if eq .type "Ready"}}{{if eq .status "True"}}node/{{$node.metadata.name}}{{"\n"}}{{end}}{{end}}{{end}}{{end}}'); do
+      # See https://medium.com/@robert.i.sandor/getting-started-with-parallelization-in-bash-e114f4353691
+      ((i = i % PARALLELJOBS))
+      ((i++ == 0)) && wait
+      (
+        # shellcheck disable=2016
+        if ! MGMT_MILLICORES=$(oc get "${node}" -o jsonpath='{.status.allocatable.management\.workload\.openshift\.io\/cores}'); then
+          msg "${ORANGE}Error running oc get ${node}${NOCOLOR}"
+        else
+          if [ -z "${MGMT_MILLICORES}" ]; then
+            msg "${RED}Workload partitioning is not configured in  ${node}${NOCOLOR}"
+            echo 1 >$tmperrorfile
+          fi
+        fi
+      ) &
+    done
+    wait
+    if [ "$(cat $tmperrorfile)" -eq 1 ]; then
+      errors=$(("${errors}" + 1))
+      if [ ! -z "${ERRORFILE}" ]; then
+        echo $errors >${ERRORFILE}
+      fi
+      return "${OCSKIP}"
+    else
+      return "${OCOK}"
+    fi
+  else
+    msg "Couldn't get nodes, check permissions"
+    return "${OCSKIP}"
+  fi
+  return "${OCUNKNOWN}"
+}
+
+
+
+check_wlp_applied(){
+  if oc auth can-i get ns >/dev/null 2>&1; then
+    for ns in $(oc get ns -o go-template='{{range .items}}{{$ns := .}}{{$ns.metadata.name}}{{"\n"}}{{end}}'); do
+      # See https://medium.com/@robert.i.sandor/getting-started-with-parallelization-in-bash-e114f4353691
+      ((i = i % PARALLELJOBS))
+      ((i++ == 0)) && wait
+      (
+        if [ ! -z $(echo $ns |grep openshift) ]; then
+          for po in $(oc -n $ns get po -o go-template='{{range .items}}{{$po := .}}{{if eq .status.phase "Running"}}{{$po.metadata.name}}{{"\n"}}{{end}}{{end}}'); do
+            export_pod=0
+            for co in $(oc -n $ns get po/$po -o go-template='{{range .spec.containers}}{{$co := .}}{{$co.resources.limits}}{{"\n"}}{{end}}'); do
+              if [ -z $(echo $co |grep management.workload.openshift.io/cores) ]; then
+                export_pod=1
+              fi
+            done
+            if [ $export_pod -ne 0 ]; then
+              msg "${YELLOW}exporting pod $po namespace $ns for further inspection${NOCOLOR}"
+              oc get ns/$ns -oyaml > $export_dir/wlp-check-$ns-ns.yaml
+              oc -n $ns get po/$po -oyaml > $export_dir/wlp-check-$po-pod.yaml
+            fi
+          done
+        fi
+      ) &     
+    done
+    wait
+    return "${OCOK}"
+  else
+    msg "Couldn't get namespaces, check permissions"
+    return "${OCSKIP}"
+  fi
+  return "${OCUNKNOWN}"
+}
+
+
+export_manifests(){
+  if oc auth can-i get mc >/dev/null 2>&1; then
+    for mc in $(oc get mc -o go-template='{{range .items}}{{$mc := .}}{{$mc.metadata.name}}{{"\n"}}{{end}}'); do
+      ((i = i % PARALLELJOBS))
+      ((i++ == 0)) && wait
+      (
+        msg "${BLUE}machineconfig: $mc${NOCOLOR}"
+        oc get mc/$mc -oyaml > $export_dir/mc-$mc.yaml
+      ) &
+    done
+    wait
+  else
+    msg "Couldn't get machineconfigs, check permissions"
+    return "${OCSKIP}"
+  fi
+  if oc auth can-i get tuned >/dev/null 2>&1; then
+    for td in $(oc get tuneds -A -o go-template='{{range .items}}{{$td := .}}{{$td.metadata.name}}{{"\n"}}{{end}}'); do
+      ((i = i % PARALLELJOBS))
+      ((i++ == 0)) && wait
+      (
+        msg "${BLUE}tuned $td${NOCOLOR}"
+        oc -n openshift-cluster-node-tuning-operator get tuned/$td -oyaml > $export_dir/tuned-$td.yaml
+      ) &
+    done
+    wait
+  else
+    msg "Couldn't get tuneds, check permissions"
+    return "${OCSKIP}"
+  fi
+  if oc auth can-i get performanceprofile >/dev/null 2>&1; then
+    for pp in $(oc get performanceprofile -o go-template='{{range .items}}{{$pp := .}}{{$pp.metadata.name}}{{"\n"}}{{end}}'); do
+      ((i = i % PARALLELJOBS))
+      ((i++ == 0)) && wait
+      (
+        msg "${BLUE}Performance profile $pp${NOCOLOR}"
+        oc get performanceprofile/$pp -oyaml > $export_dir/performanceprofile-$pp.yaml
+      ) &
+    done
+    wait
+  else
+    msg "Couldn't get performanceprofile, check permissions"
+    return "${OCSKIP}"
+  fi
+  if oc auth can-i get ptpconfig >/dev/null 2>&1; then
+    for pc in $(oc get ptpconfig -o go-template='{{range .items}}{{$pc := .}}{{$pc.metadata.namespace}},{{$pc.metadata.name}}{{"\n"}}{{end}}'); do
+        ns_n=(${pc//,/ })
+        ns=${ns_n[0]}
+        name=${ns_n[1]}
+        msg "${BLUE}PTP config $name in namespace $ns $pp${NOCOLOR}"
+        oc -n $ns get ptpconfig/$name -oyaml > $export_dir/ptpconfig-$name-$ns.yaml
+        
+    done
+    wait
+  else
+    msg "Couldn't get performanceprofile, check permissions"
+    return "${OCSKIP}"
+  fi
+
+  return "${OCUNKNOWN}"
+}
+
+export_nodes(){
+  if oc auth can-i get node >/dev/null 2>&1; then
+    echo 0 >"$tmperrorfile"
+    # shellcheck disable=SC2016
+    for node in $(oc get nodes -o go-template='{{range .items}}{{$node := .}}{{range .status.conditions}}{{if eq .type "Ready"}}{{if eq .status "True"}}{{$node.metadata.name}}{{"\n"}}{{end}}{{end}}{{end}}{{end}}'); do
+      # See https://medium.com/@robert.i.sandor/getting-started-with-parallelization-in-bash-e114f4353691
+      ((i = i % PARALLELJOBS))
+      ((i++ == 0)) && wait
+      (
+        msg "${BLUE}Node $node${NOCOLOR}" 
+        if ! $(oc get no/$node -oyaml > $export_dir/node-$node.yaml); then
+          echo 1 >$tmperrorfile
+          msg "${RED}couldn't export node $node${NOCOLOR}"
+        fi
+      ) &
+    done
+    wait
+    if [ "$(cat $tmperrorfile)" -eq 1 ]; then
+      errors=$(("${errors}" + 1))
+      if [ ! -z "${ERRORFILE}" ]; then
+        echo $errors >${ERRORFILE}
+      fi
+      return "${OCERROR}"
+    else
+      return "${OCOK}"
+    fi
+  else
+    msg "Couldn't get nodes, check permissions"
+    return "${OCSKIP}"
+  fi
+  return "${OCUNKNOWN}"
+}
+
+
+if [[ "${BASH_SOURCE[0]}" = "${0}" ]]; then
+  now=$(date -Iminutes)
+  export_dir=/tmp/ran-export-$now
+  mkdir $export_dir
+  msg "${GREEN}Checking workload partitioning on nodes${NOCOLOR}"
+  check_wlp_configured
+  rv=$?
+  if [ $rv -eq 0 ]; then
+    msg "${GREEN}Checking workload partitioning constraints on pods in openshift namespaces${NOCOLOR}"
+    check_wlp_applied
+  fi
+  msg "${GREEN}Exporting nodes${NOCOLOR}"
+  export_nodes
+
+  msg "${GREEN}Exporting manifests${NOCOLOR}"
+  export_manifests
+  msg "${GREEN}Export done in $export_dir ${NOCOLOR}"
+fi
